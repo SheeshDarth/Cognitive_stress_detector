@@ -1,172 +1,222 @@
-import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-
 import cv2
-import numpy as np
-from tensorflow.keras.models import load_model
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+import winsound
 from ultralytics import YOLO
-import tensorflow as tf
-import datetime
-from playsound import playsound
-import time
+from torchvision import models
+from PIL import Image
+import threading
+from queue import Queue
 
-# ========== Load Models ==========
-print("[INFO] Loading models...")
-emotion_model = load_model(r"C:\Users\Siddharth\cognitive-fatigue-detector\models\emotion_model_cnn.keras")
-fatigue_model = load_model(r"C:\Users\Siddharth\cognitive-fatigue-detector\models\daisee_fatigue_cnn.keras")
-drowsy_model = load_model(r"C:\Users\Siddharth\cognitive-fatigue-detector\models\nthu_drowsy_cnn.keras")
-yawn_model = load_model(r"C:\Users\Siddharth\cognitive-fatigue-detector\models\yawdd_model.keras")
-yolo_model = YOLO(r"C:\Users\Siddharth\cognitive-fatigue-detector\runs\detect\train5\weights\best.pt")
-print("[INFO] Models loaded.")
+# --- DEFINE THE CUSTOM CNN FOR EMOTION RECOGNITION ---
+class EmotionCNN(nn.Module):
+    def __init__(self):
+        super(EmotionCNN, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.flatten = nn.Flatten()
+        # Input: 48x48 -> Pool -> 24x24 -> Pool -> 12x12 -> Pool -> 6x6
+        # 128 channels * 6 * 6 = 4608
+        self.fc1 = nn.Linear(128 * 6 * 6, 1024)
+        self.dropout = nn.Dropout(0.5)
+        self.fc2 = nn.Linear(1024, 8)
 
-emotion_labels = ['Anger', 'Contempt', 'Disgust', 'Fear', 'Happy', 'Neutral', 'Sad', 'Surprise']
-fatigue_labels = ['Low', 'Medium', 'High']
-drowsy_labels = ['Alert', 'Drowsy']  # 0: eyes open, 1: eyes closed
-yawn_labels = ['Normal', 'Talking', 'Yawning']
+    def forward(self, x):
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))
+        x = self.pool(F.relu(self.bn3(self.conv3(x))))
+        x = self.flatten(x)
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
 
-# ========== Webcam Selection ==========
-# Set this to the index found with the camera test code above
-CAMERA_INDEX = 0  # Change to 1, 2, etc. if needed for your phone webcam
+# --- THREAD-SAFE VIDEO CAPTURE CLASS ---
+class VideoCapture:
+    def __init__(self, src=0):
+        self.cap = cv2.VideoCapture(src)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.q = Queue()
+        self.stopped = False
+        t = threading.Thread(target=self._reader)
+        t.daemon = True
+        t.start()
 
-cap = cv2.VideoCapture(CAMERA_INDEX)
-if not cap.isOpened():
-    raise RuntimeError(f"Could not open webcam at index {CAMERA_INDEX}.")
-print(f"[INFO] Webcam {CAMERA_INDEX} opened.")
+    def _reader(self):
+        while not self.stopped:
+            ret, frame = self.cap.read()
+            if not ret:
+                self.stop()
+                return
+            if not self.q.empty():
+                try:
+                    self.q.get_nowait()  # Discard old frame to prevent lag
+                except Queue.Empty:
+                    pass
+            self.q.put(frame)
 
-log_file = open("stress_events.csv", "a")
-if log_file.tell() == 0:
-    log_file.write("Timestamp,Emotion,Fatigue,Drowsy,Yawn\n")
+    def read(self):
+        return self.q.get()
 
-cv2.namedWindow("Cognitive Fatigue Detector", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("Cognitive Fatigue Detector", 900, 700)
+    def stop(self):
+        self.stopped = True
+        self.cap.release()
 
-frame_skip = 2  # Only run inference every N frames
-frame_count = 0
-last_results = []
-eyes_closed_start_time = None
-alarm_played = False
+# --- SETUP AND PATHS ---
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[INFO] Using device: {device}")
 
+DAISEE_MODEL_PATH = "C:/Users/Siddharth/cognitive-fatigue-detector/models/resnet18_daisee.pt"
+YOLO_MODEL_PATH = "C:/Users/Siddharth/cognitive-fatigue-detector/models/yolov8_fatigue.pt"
+YAWDD_MODEL_PATH = r"C:\Users\Siddharth\cognitive-fatigue-detector\models\yawdd_model.pth"
+FERPLUS_MODEL_PATH = r"C:\Users\Siddharth\cognitive-fatigue-detector\models\emotion_model_cnn.pth"
+NTHU_MODEL_PATH = r"C:\Users\Siddharth\cognitive-fatigue-detector\models\nthu_drowsy_cnn.pth"
+
+# --- MODEL LOADING ---
+# Load DAISEE Model
+daisee_model = models.resnet18(weights=None)
+daisee_model.fc = nn.Linear(daisee_model.fc.in_features, 4)
+daisee_model.load_state_dict(torch.load(DAISEE_MODEL_PATH, map_location=device, weights_only=True))
+daisee_model.to(device).eval()
+
+# Load YawDD Model
+yawdd_model = models.resnet18(weights=None)
+yawdd_model.fc = nn.Linear(yawdd_model.fc.in_features, 3)
+yawdd_model.load_state_dict(torch.load(YAWDD_MODEL_PATH, map_location=device, weights_only=True))
+yawdd_model.to(device).eval()
+
+# Load FERPlus Model
+FERPLUS_LOADED = False
 try:
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("[WARN] Failed to grab frame.")
-            continue
+    ferplus_model = EmotionCNN().to(device)
+    ferplus_model.load_state_dict(torch.load(FERPLUS_MODEL_PATH, map_location=device, weights_only=True))
+    ferplus_model.eval()
+    FERPLUS_LOADED = True
+    print("[INFO] FERPlus model loaded successfully.")
+except Exception as e:
+    print(f"[WARNING] FERPlus (EmotionCNN) model could not be loaded. Skipping. Error: {e}")
 
-        # Mirror the frame for natural webcam feel
-        frame = cv2.flip(frame, 1)
-        display_frame = frame.copy()
-        frame_count += 1
+# Load NTHU-DDD Model
+NTHU_LOADED = False
+try:
+    nthu_model = models.resnet18(weights=None).to(device)
+    nthu_model.fc = nn.Linear(nthu_model.fc.in_features, 2)
+    nthu_model.load_state_dict(torch.load(NTHU_MODEL_PATH, map_location=device, weights_only=True))
+    nthu_model.eval()
+    NTHU_LOADED = True
+    print("[INFO] NTHU-DDD model loaded successfully.")
+except Exception as e:
+    print(f"[WARNING] NTHU-DDD model not found or architecture mismatch. Skipping. Error: {e}")
 
-        # Only run inference every N frames
-        if frame_count % frame_skip == 0:
-            last_results = []
-            infer_frame = cv2.resize(frame, (416, 416))
-            yolo_results = yolo_model.predict(infer_frame, verbose=False)[0]
-            boxes = yolo_results.boxes.xyxy.cpu().numpy()
-            scale_x = frame.shape[1] / 416
-            scale_y = frame.shape[0] / 416
-            boxes = np.array([
-                [int(x1*scale_x), int(y1*scale_y), int(x2*scale_x), int(y2*scale_y)]
-                for x1, y1, x2, y2 in boxes
-            ])
-            classes = yolo_results.boxes.cls.cpu().numpy()
+# Load YOLO Model
+yolo_model = YOLO(YOLO_MODEL_PATH)
 
-            eyes_closed_detected = False
+# --- IMAGE TRANSFORMS ---
+transform_rgb = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
 
-            for box, cls_id in zip(boxes, classes):
-                x1, y1, x2, y2 = box
-                # Ensure box is within frame bounds
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
-                face_crop = frame[y1:y2, x1:x2]
-                if face_crop.size == 0 or (x2-x1) < 10 or (y2-y1) < 10:
-                    continue
+transform_gray = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.Grayscale(num_output_channels=1),
+    transforms.Resize((48, 48)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5], std=[0.5]),
+])
 
-                try:
-                    face_gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
-                    face_gray_resized = cv2.resize(face_gray, (48,48))/255.0
-                    face_gray_resized = np.expand_dims(face_gray_resized, (-1,0))
-                    face_rgb_resized = cv2.resize(face_crop, (48,48))/255.0
-                    face_rgb_resized = np.expand_dims(face_rgb_resized,0)
-                except Exception as e:
-                    print("[ERROR] Face preprocessing error:", e)
-                    continue
+# --- SCORING LOGIC AND MAPPINGS ---
+FERPLUS_EMOTIONS = {0: 'neutral', 1: 'happiness', 2: 'surprise', 3: 'sadness', 4: 'anger', 5: 'disgust', 6: 'fear', 7: 'contempt'}
+FATIGUE_EMOTIONS = {'sadness', 'anger', 'contempt', 'neutral'}
 
-                emotion_pred = fatigue_pred = drowsy_pred = yawn_pred = -1
-                try:
-                    emotion_pred = emotion_model.predict(face_gray_resized,verbose=0).argmax()
-                    fatigue_pred = fatigue_model.predict(face_gray_resized,verbose=0).argmax()
-                    drowsy_pred = drowsy_model.predict(face_gray_resized,verbose=0).argmax()
-                    yawn_pred = yawn_model.predict(face_rgb_resized,verbose=0).argmax()
-                except Exception as e:
-                    print("[ERROR] Prediction error:", e)
+def compute_fatigue_score(outputs):
+    score, total_sources = 0, 0
+    if "daisee" in outputs:
+        total_sources += 1
+        if outputs["daisee"] in [2, 3]: score += 1
+    if "yawdd" in outputs:
+        total_sources += 1
+        if outputs["yawdd"] in [1, 2]: score += 1
+    if "yolo" in outputs:
+        total_sources += 1
+        if outputs["yolo"]: score += 1
+    if FERPLUS_LOADED and "ferplus" in outputs:
+        total_sources += 1
+        if FERPLUS_EMOTIONS.get(outputs["ferplus"]) in FATIGUE_EMOTIONS: score += 1
+    if NTHU_LOADED and "nthu" in outputs:
+        total_sources += 1
+        if outputs["nthu"] == 1: score += 1
+    return score, total_sources
 
-                # Only set eyes_closed_detected if drowsy_pred is valid
-                if drowsy_pred == 1:
-                    eyes_closed_detected = True
+# --- MAIN APPLICATION LOOP ---
+cap = VideoCapture(0)
+print("[INFO] Live Fatigue Monitor started. Press 'q' to quit.")
 
-                is_stress = (
-                    fatigue_pred == 2 or
-                    drowsy_pred == 1 or
-                    yawn_pred == 2 or
-                    emotion_pred in [0,3,6]
-                )
+# Variables for throttling and persistent display
+frame_counter = 0
+inference_interval = 5  # Run inference every 5 frames (~6 FPS)
+outputs = {}
+yolo_results = None
 
-                if is_stress:
-                    timestamp = datetime.datetime.now().isoformat()
-                    log_file.write(
-                        f"{timestamp},{emotion_labels[emotion_pred]},{fatigue_labels[fatigue_pred]},{drowsy_labels[drowsy_pred]},{yawn_labels[yawn_pred]}\n"
-                    )
-                    log_file.flush()
+while True:
+    frame = cap.read()
+    frame_counter += 1
 
-                last_results.append({
-                    "box": (x1, y1, x2, y2),
-                    "is_stress": is_stress,
-                    "emotion": emotion_pred,
-                    "fatigue": fatigue_pred,
-                    "drowsy": drowsy_pred,
-                    "yawn": yawn_pred
-                })
+    # --- THROTTLED INFERENCE BLOCK ---
+    # Only run the heavy models periodically
+    if frame_counter % inference_interval == 0:
+        try:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            input_tensor_rgb = transform_rgb(frame_rgb).unsqueeze(0).to(device)
+            if FERPLUS_LOADED:
+                input_tensor_gray = transform_gray(frame_rgb).unsqueeze(0).to(device)
+            
+            with torch.no_grad():
+                outputs["daisee"] = torch.argmax(daisee_model(input_tensor_rgb), dim=1).item()
+                outputs["yawdd"] = torch.argmax(yawdd_model(input_tensor_rgb), dim=1).item()
+                if NTHU_LOADED:
+                    outputs["nthu"] = torch.argmax(nthu_model(input_tensor_rgb), dim=1).item()
+                if FERPLUS_LOADED:
+                    outputs["ferplus"] = torch.argmax(ferplus_model(input_tensor_gray), dim=1).item()
 
-            # Timestamp-based alarm
-            if eyes_closed_detected:
-                if eyes_closed_start_time is None:
-                    eyes_closed_start_time = time.time()
-            else:
-                eyes_closed_start_time = None
-                alarm_played = False
-
-            if eyes_closed_start_time:
-                closed_duration = time.time() - eyes_closed_start_time
-                if closed_duration >= 2.0 and not alarm_played:
-                    try:
-                        playsound(r"C:\Users\Siddharth\cognitive-fatigue-detector\japan-eas-alarm-j-alert-262887.wav")
-                        alarm_played = True
-                    except Exception as e:
-                        print("[WARN] Could not play sound:", e)
-
-        # Draw
-        for res in last_results:
-            x1, y1, x2, y2 = res["box"]
-            color = (0,0,255) if res["is_stress"] else (0,255,0)
-            cv2.rectangle(display_frame,(x1,y1),(x2,y2),color,2)
-            label_text = (
-                f"E:{emotion_labels[res['emotion']]} "
-                f"F:{fatigue_labels[res['fatigue']]} "
-                f"D:{drowsy_labels[res['drowsy']]} "
-                f"Y:{yawn_labels[res['yawn']]}"
+            yolo_results_new = yolo_model(frame, verbose=False)[0]
+            outputs["yolo"] = any(
+                yolo_model.names[int(box.cls.item())] in ['yawn', 'drowsy', 'distraction', 'phone_usage']
+                for box in yolo_results_new.boxes
             )
-            (tw,th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX,0.6,2)
-            label_y = max(y1 - th - 8,0)
-            cv2.rectangle(display_frame,(x1,label_y),(x1+tw+8,label_y+th+12),color,-1)
-            cv2.putText(display_frame,label_text,(x1+4,label_y+th+4),cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2)
+            yolo_results = yolo_results_new # Update display results
+        except Exception as e:
+            print(f"[ERROR] Inference failed: {e}")
 
-        cv2.imshow("Cognitive Fatigue Detector", display_frame)
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
-finally:
-    cap.release()
-    log_file.close()
-    cv2.destroyAllWindows()
-    print("[INFO] Webcam and windows closed.")
+    # --- DISPLAY LOGIC (runs every frame) ---
+    score, total_sources = compute_fatigue_score(outputs)
+    frame_display = yolo_results.plot() if yolo_results else frame.copy()
+    
+    is_fatigued = score >= (total_sources / 2) and total_sources > 0
+    color = (0, 0, 255) if is_fatigued else (0, 255, 0)
+    
+    cv2.putText(frame_display, f"Fatigue Score: {score}/{total_sources}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+    if is_fatigued:
+        cv2.putText(frame_display, "ALERT: Fatigue Detected!", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+        if frame_counter % inference_interval == 0: # Beep only on inference frames
+            winsound.Beep(2000, 500)
+
+    cv2.imshow("Live Fatigue Monitor", frame_display)
+
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+# --- CLEANUP ---
+cap.stop()
+cv2.destroyAllWindows()
+print("[INFO] Application terminated.")
